@@ -33,22 +33,21 @@ def save_seen_ids(seen_ids, sha=None):
         payload["sha"] = sha
     requests.put(url, headers=headers, json=payload)
 
-def get_tweet_details(tweet_id):
-    """Get full thread context for a tweet."""
+def get_original_tweet(tweet_id):
     try:
         headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": RAPIDAPI_HOST}
         url  = f"https://{RAPIDAPI_HOST}/tweet-detail?id={tweet_id}"
         resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code != 200:
             return None
-        data = resp.json()
-        instructions = data.get("result", {}).get("timeline", {}).get("instructions", [])
-        tweets_in_thread = []
+        instructions = resp.json().get("result", {}).get("timeline", {}).get("instructions", [])
         for instruction in instructions:
             for entry in instruction.get("entries", []):
-                for item in entry.get("content", {}).get("items", [entry.get("content", {})]):
+                for item in [entry] + entry.get("content", {}).get("items", []):
                     try:
-                        ic = item.get("item", item).get("itemContent", item.get("itemContent", {}))
+                        ic = item.get("content", item.get("item", {}).get("itemContent", {}))
+                        if "itemContent" in ic:
+                            ic = ic["itemContent"]
                         r  = ic.get("tweet_results", {}).get("result", {})
                         if "tweet" in r:
                             r = r["tweet"]
@@ -56,43 +55,60 @@ def get_tweet_details(tweet_id):
                         user = r.get("core", {}).get("user_results", {}).get("result", {}).get("core", {}).get("screen_name", "")
                         tid  = lg.get("id_str", "")
                         text = lg.get("full_text", "")
-                        if tid and text and user:
-                            tweets_in_thread.append({"id": tid, "text": text, "user": user})
+                        if tid == tweet_id and text and user:
+                            return {"text": text, "user": user}
                     except (KeyError, TypeError):
                         pass
-        # Return only the tweet being replied to (not the FortniteStatus tweet itself)
-        for t in tweets_in_thread:
-            if t["id"] == tweet_id and t["user"] != TWITTER_USERNAME:
-                return t
-            if t["id"] != tweet_id and t["user"] != TWITTER_USERNAME:
-                return t
     except Exception as e:
-        print(f"[!] Thread fetch error: {e}")
+        print(f"[!] Original tweet fetch error: {e}")
     return None
 
 def send_telegram(tweet):
     is_reply  = bool(tweet.get("reply_to"))
-    label     = "💬 Reply" if is_reply else "📢 Tweet"
     tweet_url = f"https://x.com/{TWITTER_USERNAME}/status/{tweet['id']}"
-    msg = f"{label} from @{TWITTER_USERNAME}\n\n"
-    if tweet.get("original"):
-        msg += f"↩️ @{tweet['original']['user']} said:\n\"{tweet['original']['text']}\"\n\n"
-    msg += f"{tweet['text']}\n\n🔗 {tweet_url}"
-    resp = requests.post(
+
+    if is_reply and tweet.get("original"):
+        # Format exactly like X — original message first, then reply below
+        orig = tweet["original"]
+        msg  = (
+            f"@{orig['user']}:\n"
+            f"{orig['text']}\n\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"↩️ @{TWITTER_USERNAME} replied:\n"
+            f"{tweet['text']}\n\n"
+            f"🔗 {tweet_url}"
+        )
+    else:
+        msg = (
+            f"📢 @{TWITTER_USERNAME}:\n\n"
+            f"{tweet['text']}\n\n"
+            f"🔗 {tweet_url}"
+        )
+
+    requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
         json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}
     )
-    print(f"[+] Telegram: {resp.status_code}")
+    print(f"[+] Telegram sent")
 
 def send_discord(tweet):
     if not DISCORD_WEBHOOK_URL:
         return
-    is_reply = bool(tweet.get("reply_to"))
-    color    = 0x1DA1F2 if not is_reply else 0x657786
-    desc     = ""
-    if tweet.get("original"):
-        desc += f"> **@{tweet['original']['user']}:** {tweet['original']['text']}\n\n"
-    desc += tweet["text"]
+    is_reply  = bool(tweet.get("reply_to"))
+    tweet_url = f"https://x.com/{TWITTER_USERNAME}/status/{tweet['id']}"
+
+    if is_reply and tweet.get("original"):
+        orig  = tweet["original"]
+        color = 0x657786
+        desc  = (
+            f"> **@{orig['user']}:** {orig['text']}\n\n"
+            f"↩️ **@{TWITTER_USERNAME} replied:**\n"
+            f"{tweet['text']}"
+        )
+    else:
+        color = 0x1DA1F2
+        desc  = tweet["text"]
+
     embed = {"embeds": [{
         "author": {
             "name":     f"@{TWITTER_USERNAME}",
@@ -102,10 +118,10 @@ def send_discord(tweet):
         "description": desc,
         "color": color,
         "footer": {"text": "🎮 Fortnite Status" + (" • Reply" if is_reply else " • Tweet")},
-        "url": f"https://x.com/{TWITTER_USERNAME}/status/{tweet['id']}"
+        "url": tweet_url
     }]}
-    resp = requests.post(DISCORD_WEBHOOK_URL, json=embed)
-    print(f"[+] Discord: {resp.status_code}")
+    requests.post(DISCORD_WEBHOOK_URL, json=embed)
+    print(f"[+] Discord sent")
 
 def fetch_tweets():
     headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": RAPIDAPI_HOST}
@@ -164,7 +180,7 @@ def main():
         return
     for t in reversed(new):
         if t.get("reply_to"):
-            original = get_tweet_details(t["reply_to"])
+            original = get_original_tweet(t["reply_to"])
             if original:
                 t["original"] = original
         send_telegram(t)
